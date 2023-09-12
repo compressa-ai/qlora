@@ -28,7 +28,8 @@ from transformers import (
     set_seed,
     Seq2SeqTrainer,
     BitsAndBytesConfig,
-    LlamaTokenizer
+    LlamaTokenizer,
+    AutoConfig
 
 )
 from datasets import load_dataset, Dataset
@@ -42,6 +43,13 @@ from peft import (
 )
 from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch, infer_auto_device_map, load_checkpoint_in_model
+from awq.quantize.quantizer import real_quantize_model_weight, pseudo_quantize_model_weight
+from awq.quantize.qmodule import WQLinear
+from awq.utils.utils import simple_dispatch_model
+from lm_eval import evaluator # TODO: make use of evaluation pipeline from llm-awq 
+from awq.quantize.pre_quant import run_awq, apply_awq  # TODO: make use of run_awq pipeline from llm-awq
 
 
 def is_ipex_available():
@@ -88,6 +96,14 @@ class ModelArguments:
         default=False,
         metadata={"help": "Enables using Huggingface auth token from Git Credentials."}
     )
+    # parameters for awq quantized model
+    awq: Optional[bool] = field(default=False, metadata={"help": "If true awq quantized model will be used."})
+    q_backend: Optional[str] = field(default="fake", metadata={"help": 'choices=["fake", "real"].'})
+    load_awq: Optional[str] = field(default=None, metadata={"help": "Load the awq search results."})
+    load_quant: Optional[str] = field(default=None, metadata={"help": "Load quantized model."})
+    no_zero_point: Optional[bool] = field(default=False, metadata={"help": "disable zero_point"})
+    q_group_size: Optional[int] = field(default=128)
+
 
 @dataclass
 class DataArguments:
@@ -247,6 +263,10 @@ class GenerationArguments:
 
 def find_all_linear_names(args, model):
     cls = bnb.nn.Linear4bit if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
+    if args.load_quant:
+        cls = WQLinear
+    if args.load_awq:
+        cls = torch.nn.Linear 
     lora_module_names = set()
     for name, module in model.named_modules():
         if isinstance(module, cls):
@@ -308,26 +328,83 @@ def get_accelerate_model(args, checkpoint_dir):
 
     print(f'loading base model {args.model_name_or_path}...')
     compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        cache_dir=args.cache_dir,
-        load_in_4bit=args.bits == 4,
-        load_in_8bit=args.bits == 8,
-        device_map=device_map,
-        max_memory=max_memory,
-        quantization_config=BitsAndBytesConfig(
+
+    if not args.awq:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            cache_dir=args.cache_dir,
             load_in_4bit=args.bits == 4,
             load_in_8bit=args.bits == 8,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False,
-            bnb_4bit_compute_dtype=compute_dtype,
-            bnb_4bit_use_double_quant=args.double_quant,
-            bnb_4bit_quant_type=args.quant_type,
-        ),
-        torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
-        trust_remote_code=args.trust_remote_code,
-        use_auth_token=args.use_auth_token
-    )
+            device_map=device_map,
+            max_memory=max_memory,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=args.bits == 4,
+                load_in_8bit=args.bits == 8,
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False,
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=args.double_quant,
+                bnb_4bit_quant_type=args.quant_type,
+            ),
+            torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+            trust_remote_code=args.trust_remote_code,
+            use_auth_token=args.use_auth_token
+        )
+    else:
+        config = AutoConfig.from_pretrained(args.model_name_or_path)
+
+        if args.load_awq:
+            with init_empty_weights():
+                model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, config=config,
+                                                            torch_dtype=torch.float16, low_cpu_mem_usage=True)  # 32!!!
+            model.eval()
+            print("Loading pre-computed AWQ results from", args.load_awq)
+            awq_results = torch.load(args.load_awq, map_location="cpu")
+            apply_awq(model, awq_results)
+
+            kwargs = {"max_memory": max_memory} if len(max_memory) else {}
+            device_map = infer_auto_device_map(
+                model,
+                no_split_module_classes=[
+                    "OPTDecoderLayer", "LlamaDecoderLayer", "BloomBlock", "MPTBlock", "DecoderLayer"],
+                **kwargs
+            )
+
+        q_config = {"zero_point": not args.no_zero_point, "q_group_size": args.q_group_size}  # TODO
+        if args.bits is not None:
+            if args.q_backend == "fake":
+                pseudo_quantize_model_weight(
+                    model, w_bit=args.bits, q_config=q_config)
+            if args.q_backend == "real":
+                print("Loading pre-computed quantized weights...")
+                with init_empty_weights():
+                    model = AutoModelForCausalLM.from_config(config=config,
+                                                             torch_dtype=torch.float16, trust_remote_code=True)
+                real_quantize_model_weight(
+                    model, w_bit=args.bits, q_config=q_config, init_only=True)
+        
+                model.tie_weights()
+
+                # Infer device map
+                kwargs = {"max_memory": max_memory} if len(max_memory) else {}
+                device_map = infer_auto_device_map(
+                    model,
+                    no_split_module_classes=[
+                        "OPTDecoderLayer", "LlamaDecoderLayer", "BloomBlock", "MPTBlock", "DecoderLayer"],
+                    **kwargs
+                )
+                # Load checkpoint in the model 
+                load_checkpoint_in_model(
+                    model,
+                    checkpoint=args.load_quant,
+                    device_map=device_map,
+                    offload_state_dict=True,
+                )
+
+        # Dispatch model
+        model = simple_dispatch_model(model, device_map=device_map)
+        model.eval()
+
     if compute_dtype == torch.float16 and args.bits == 4:
         if torch.cuda.is_bf16_supported():
             print('='*80)
@@ -391,6 +468,7 @@ def get_accelerate_model(args, checkpoint_dir):
                 bias="none",
                 task_type="CAUSAL_LM",
             )
+            model.enable_input_require_grads()  # no_grad issue
             model = get_peft_model(model, config)
 
     for name, module in model.named_modules():
@@ -586,6 +664,8 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             return load_dataset("akoksal/LongForm")
         elif dataset_name == 'oasst1':
             return load_dataset("timdettmers/openassistant-guanaco")
+        elif dataset_name == 'wikitext':
+            return load_dataset('wikitext', 'wikitext-2-v1') # 'wikitext-103-v1', 'wikitext-2-v1', 'wikitext-103-raw-v1', 'wikitext-2-raw-v1']
         elif dataset_name == 'vicuna':
             raise NotImplementedError("Vicuna data was not released.")
         else:
@@ -619,6 +699,11 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
                 'output': x['chosen']
             })
         elif dataset_format == 'oasst1' or (dataset_format is None and args.dataset == 'oasst1'):
+            dataset = dataset.map(lambda x: {
+                'input': '',
+                'output': x['text'],
+            })
+        elif dataset_format == 'wikitext' or (dataset_format is None and args.dataset == 'wikitext'):
             dataset = dataset.map(lambda x: {
                 'input': '',
                 'output': x['text'],
