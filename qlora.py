@@ -7,6 +7,7 @@ import json
 import os
 from os.path import exists, join, isdir
 from dataclasses import dataclass, field
+from pathlib import Path
 import sys
 from typing import Optional, Dict, Sequence
 import numpy as np
@@ -50,6 +51,10 @@ from awq.quantize.qmodule import WQLinear
 from awq.utils.utils import simple_dispatch_model
 from lm_eval import evaluator # TODO: make use of evaluation pipeline from llm-awq 
 from awq.quantize.pre_quant import run_awq, apply_awq  # TODO: make use of run_awq pipeline from llm-awq
+
+from awq.omniquant.LMClass import LMClass
+from awq.omniquant.evaluate import evaluate as omni_eval
+from awq.omniquant.utils import create_logger
 
 
 def is_ipex_available():
@@ -103,6 +108,10 @@ class ModelArguments:
     load_quant: Optional[str] = field(default=None, metadata={"help": "Load quantized model."})
     no_zero_point: Optional[bool] = field(default=False, metadata={"help": "disable zero_point"})
     q_group_size: Optional[int] = field(default=128)
+    omni_eval: Optional[bool] = field(default=False)
+    tasks: Optional[str] = field(default="")
+    batch_size: Optional[int] = field(default=1) 
+    bnb: Optional[bool] = field(default=False) 
 
 
 @dataclass
@@ -371,7 +380,7 @@ def get_accelerate_model(args, checkpoint_dir):
             )
 
         q_config = {"zero_point": not args.no_zero_point, "q_group_size": args.q_group_size}  # TODO
-        if args.bits is not None:
+        if args.bits > 0:
             if args.q_backend == "fake":
                 pseudo_quantize_model_weight(
                     model, w_bit=args.bits, q_config=q_config)
@@ -399,6 +408,16 @@ def get_accelerate_model(args, checkpoint_dir):
                     checkpoint=args.load_quant,
                     device_map=device_map,
                     offload_state_dict=True,
+                )
+        else:
+            kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
+            model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, config=config, trust_remote_code=True, **kwargs)
+            kwargs = {"max_memory": max_memory} if len(max_memory) else {}
+            device_map = infer_auto_device_map(
+                    model,
+                    no_split_module_classes=[
+                        "OPTDecoderLayer", "LlamaDecoderLayer", "BloomBlock", "MPTBlock", "DecoderLayer"],
+                    **kwargs
                 )
 
         # Dispatch model
@@ -665,7 +684,9 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         elif dataset_name == 'oasst1':
             return load_dataset("timdettmers/openassistant-guanaco")
         elif dataset_name == 'wikitext':
-            return load_dataset('wikitext', 'wikitext-2-v1') # 'wikitext-103-v1', 'wikitext-2-v1', 'wikitext-103-raw-v1', 'wikitext-2-raw-v1']
+            return load_dataset('wikitext', 'wikitext-2-raw-v1') # 'wikitext-103-v1', 'wikitext-2-v1', 'wikitext-103-raw-v1', 'wikitext-2-raw-v1']
+            # traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+            # testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
         elif dataset_name == 'vicuna':
             raise NotImplementedError("Vicuna data was not released.")
         else:
@@ -898,6 +919,30 @@ def train():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
         all_metrics.update(metrics)
+    if args.omni_eval:
+        args.net = args.model_name_or_path.split("/")[-1]
+        args.model_family = "llama" 
+        args.eval_ppl = True
+        args.limit = -1
+        args.cache_dir = "./cache"
+        args.seed = 42
+        args.model = args.model_name_or_path
+        args.tasks = args.tasks.split(",")
+
+        output_dir = os.path.join(args.output_dir, "omni_eval")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+        output_dir = Path(output_dir)
+
+        lm = LMClass(args.model_name_or_path, model.model, tokenizer, args.batch_size)
+
+        logger_oe = create_logger(output_dir)
+        logger_oe.info(args)
+        results = omni_eval(lm, args, logger_oe)
+
+        ppl = results["wikitext2"]
+        with open(os.path.join(args.output_dir, "omni_eval", "eval.csv"), "+a") as f:
+            f.write(f"{args.net},{ppl}\n")
     # Prediction
     if args.do_predict:
         logger.info("*** Predict ***")
