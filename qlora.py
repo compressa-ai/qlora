@@ -109,7 +109,7 @@ class ModelArguments:
     no_zero_point: Optional[bool] = field(default=False, metadata={"help": "disable zero_point"})
     q_group_size: Optional[int] = field(default=128)
     omni_eval: Optional[bool] = field(default=False)
-    tasks: Optional[str] = field(default="")
+    tasks_str: Optional[str] = field(default="")
     batch_size: Optional[int] = field(default=1) 
     bnb: Optional[bool] = field(default=False) 
 
@@ -902,6 +902,8 @@ def train():
 
     all_metrics = {"run_name": args.run_name}
     # Training
+    if args.omni_eval:
+        run_omni_eval(args, model, tokenizer)
     if args.do_train:
         logger.info("*** Train ***")
         # Note: `resume_from_checkpoint` not supported for adapter checkpoints by HF.
@@ -920,29 +922,7 @@ def train():
         trainer.save_metrics("eval", metrics)
         all_metrics.update(metrics)
     if args.omni_eval:
-        args.net = args.model_name_or_path.split("/")[-1]
-        args.model_family = "llama" 
-        args.eval_ppl = True
-        args.limit = -1
-        args.cache_dir = "./cache"
-        args.seed = 42
-        args.model = args.model_name_or_path
-        args.tasks = args.tasks.split(",")
-
-        output_dir = os.path.join(args.output_dir, "omni_eval")
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
-        output_dir = Path(output_dir)
-
-        lm = LMClass(args.model_name_or_path, model.model, tokenizer, args.batch_size)
-
-        logger_oe = create_logger(output_dir)
-        logger_oe.info(args)
-        results = omni_eval(lm, args, logger_oe)
-
-        ppl = results["wikitext2"]
-        with open(os.path.join(args.output_dir, "omni_eval", "eval.csv"), "+a") as f:
-            f.write(f"{args.net},{ppl}\n")
+        run_omni_eval(args, model, tokenizer)
     # Prediction
     if args.do_predict:
         logger.info("*** Predict ***")
@@ -966,6 +946,34 @@ def train():
     if (args.do_train or args.do_eval or args.do_predict):
         with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
             fout.write(json.dumps(all_metrics))
+
+
+def run_omni_eval(args, model, tokenizer):
+    args.net = args.model_name_or_path.split("/")[-1]
+    args.model_family = "llama" 
+    args.eval_ppl = True
+    args.limit = -1
+    args.cache_dir = "./cache"
+    args.seed = 42
+    args.model = args.model_name_or_path
+    args.tasks = args.tasks_str.split(",")
+
+    output_dir = os.path.join(args.output_dir, "omni_eval")
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+    output_dir = Path(output_dir)
+
+    lm = LMClass(args.model_name_or_path, model.model, tokenizer, args.batch_size)
+
+    logger_oe = create_logger(output_dir)
+    logger_oe.info(args)
+    results = omni_eval(lm, args, logger_oe)
+
+    ppl = results["wikitext2"]
+    with open(os.path.join(args.output_dir, "omni_eval", "eval.csv"), "+a") as f:
+        f.write(f"{args.net},{ppl},{args.bits},{args.awq},{args.bnb}\n")
+        # f.write(f"{args.net},{ppl},{3},{args.awq},{args.bnb}\n")
+
 
 if __name__ == "__main__":
     train()
