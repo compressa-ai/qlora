@@ -303,6 +303,9 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         if os.path.exists(pytorch_model_path):
             os.remove(pytorch_model_path)
 
+        if args.omni_eval:
+            run_omni_eval(args, kwargs["model"], kwargs["tokenizer"])
+
     def on_save(self, args, state, control, **kwargs):
         self.save_model(args, state, kwargs)
         return control
@@ -815,6 +818,15 @@ def train():
 
     data_module = make_data_module(tokenizer=tokenizer, args=args)
     
+    training_args.omni_eval = args.omni_eval
+    training_args.model_name_or_path = args.model_name_or_path
+    training_args.tasks_str = args.tasks_str
+    training_args.output_dir = args.output_dir
+    training_args.cache_dir = args.cache_dir
+    training_args.batch_size = args.batch_size
+    training_args.bits = args.bits
+    training_args.awq = args.awq
+    training_args.bnb = args.bnb
     trainer = Seq2SeqTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -948,7 +960,7 @@ def train():
             fout.write(json.dumps(all_metrics))
 
 
-def run_omni_eval(args, model, tokenizer):
+def run_omni_eval(args, model, tokenizer, verbose=False):
     args.net = args.model_name_or_path.split("/")[-1]
     args.model_family = "llama" 
     args.eval_ppl = True
@@ -966,7 +978,8 @@ def run_omni_eval(args, model, tokenizer):
     lm = LMClass(args.model_name_or_path, model.model, tokenizer, args.batch_size)
 
     logger_oe = create_logger(output_dir)
-    logger_oe.info(args)
+    if verbose:
+        logger_oe.info(args)
     results = omni_eval(lm, args, logger_oe)
 
     ppl = results["wikitext2"]
