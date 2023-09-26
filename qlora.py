@@ -56,6 +56,38 @@ from awq.omniquant.LMClass import LMClass
 from awq.omniquant.evaluate import evaluate as omni_eval
 from awq.omniquant.utils import create_logger
 
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
+
+
+def replace_linear(module, 
+                   weight_quant='per_tensor', 
+                   act_quant='per_tensor', 
+                   quantize_bmm_input=True): #, bits=4):
+    iterate_over_children([None, module], 
+                          weight_quant=weight_quant, 
+                          act_quant='per_tensor', 
+                          quantize_bmm_input=quantize_bmm_input) #, bits=bits)
+    
+def iterate_over_children(module, parent=None, 
+                          weight_quant='per_tensor',
+                          act_quant='per_tensor',
+                          quantize_bmm_input=True): #, bits=4):
+    for child in module[1].named_children():
+        iterate_over_children(child, module) #, bits=bits)
+
+    if module[0] is None:
+        return
+    if isinstance(module[1], torch.nn.Linear):
+        # print(module[0])
+        # pbar.update(1)
+        l = torch.nn.Linear(in_features=module[1].in_features, out_features=module[1].out_features, bias=True)
+        l.weight.data = module[1].weight.data
+        if module[1].bias:
+            l.bias.data = module[1].bias.data
+        else:
+            l.bias.data = torch.zeros_like(l.bias.data) 
+        parent[1].__setattr__(module[0], l)
+
 
 def is_ipex_available():
     def get_major_and_minor_from_version(full_version):
@@ -424,6 +456,22 @@ def get_accelerate_model(args, checkpoint_dir):
                 )
 
         # Dispatch model
+        # model.requires_grad_(False)
+        # for name, child in model.named_children():
+        #     for param in child.parameters():
+        #         param.requires_grad = False
+
+        # print(model)
+        # for name, module in model.named_modules():
+        #     if isinstance(module, LlamaRMSNorm):
+        #         # print("Norm!")
+        #         module.requires_grad_(True)
+        #         for param in module.parameters():
+        #             param.requires_grad = True 
+        #         for name, child in module.named_children():
+        #             for param in child.parameters():
+        #                 param.requires_grad = True
+
         model = simple_dispatch_model(model, device_map=device_map)
         model.eval()
 
@@ -481,7 +529,7 @@ def get_accelerate_model(args, checkpoint_dir):
             model = PeftModel.from_pretrained(model, join(checkpoint_dir, 'adapter_model'), is_trainable=True)
         else:
             print(f'adding LoRA modules...')
-            modules = find_all_linear_names(args, model)
+            modules = [] #find_all_linear_names(args, model)
             config = LoraConfig(
                 r=args.lora_r,
                 lora_alpha=args.lora_alpha,
@@ -900,6 +948,27 @@ def train():
 
         trainer.add_callback(MMLUEvalCallback)
 
+    # replace_linear(model)
+
+    # model.requires_grad_(False)
+    # for name, child in model.named_children():
+    #     for param in child.parameters():
+    #         param.requires_grad = False
+
+    # for name, module in model.named_modules():
+    #     if isinstance(module, torch.nn.Linear):
+    #         module.bias.requires_grad = True
+
+    for name, module in model.named_modules():
+        if isinstance(module, LlamaRMSNorm):
+            # print("Norm!")
+            module.requires_grad_(True)
+            for param in module.parameters():
+                param.requires_grad = True 
+            for name, child in module.named_children():
+                for param in child.parameters():
+                    param.requires_grad = True
+
     # Verifying the datatypes and parameter counts before training.
     print_trainable_parameters(args, model)
     dtypes = {}
@@ -970,7 +1039,7 @@ def run_omni_eval(args, model, tokenizer, verbose=False):
     args.model = args.model_name_or_path
     args.tasks = args.tasks_str.split(",")
 
-    output_dir = os.path.join(args.output_dir, "omni_eval")
+    output_dir = os.path.join(args.output_dir, "omni_eval"+"_"+args.net)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
     output_dir = Path(output_dir)
@@ -983,7 +1052,7 @@ def run_omni_eval(args, model, tokenizer, verbose=False):
     results = omni_eval(lm, args, logger_oe)
 
     ppl = results["wikitext2"]
-    with open(os.path.join(args.output_dir, "omni_eval", "eval.csv"), "+a") as f:
+    with open(os.path.join(args.output_dir, "omni_eval"+"_"+args.net, "eval.csv"), "+a") as f:
         f.write(f"{args.net},{ppl},{args.bits},{args.awq},{args.bnb}\n")
         # f.write(f"{args.net},{ppl},{3},{args.awq},{args.bnb}\n")
 
