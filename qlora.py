@@ -85,7 +85,8 @@ def iterate_over_children(module, parent=None,
         if module[1].bias:
             l.bias.data = module[1].bias.data
         else:
-            l.bias.data = torch.zeros_like(l.bias.data) 
+            l.bias.data = torch.zeros_like(l.bias.data)
+        l.to(module[1].weight.device)
         parent[1].__setattr__(module[0], l)
 
 
@@ -126,7 +127,7 @@ class ModelArguments:
         default="EleutherAI/pythia-12b"
     )
     trust_remote_code: Optional[bool] = field(
-        default=False,
+        default=True,
         metadata={"help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."}
     )
     use_auth_token: Optional[bool] = field(
@@ -496,7 +497,7 @@ def get_accelerate_model(args, checkpoint_dir):
         cache_dir=args.cache_dir,
         padding_side="right",
         use_fast=False, # Fast tokenizer giving issues.
-        tokenizer_type='llama' if 'llama' in args.model_name_or_path else None, # Needed for HF name change
+        tokenizer_type='llama' if 'lama' in args.model_name_or_path.split("/")[-1] else None, # Needed for HF name change
         trust_remote_code=args.trust_remote_code,
         use_auth_token=args.use_auth_token,
     )
@@ -506,19 +507,21 @@ def get_accelerate_model(args, checkpoint_dir):
             tokenizer=tokenizer,
             model=model,
         )
-    if 'llama' in args.model_name_or_path or isinstance(tokenizer, LlamaTokenizer):
+    if 'falcon' in args.model_name_or_path or 'llama' in args.model_name_or_path or isinstance(tokenizer, LlamaTokenizer):
         # LLaMA tokenizer may not have correct special tokens set.
         # Check and add them if missing to prevent them from being parsed into different tokens.
         # Note that these are present in the vocabulary.
         # Note also that `model.config.pad_token_id` is 0 which corresponds to `<unk>` token.
         print('Adding special tokens.')
-        tokenizer.add_special_tokens({
-                "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
-                "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
-                "unk_token": tokenizer.convert_ids_to_tokens(
-                    model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
-                ),
-        })
+        spec_tokens = {
+            "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
+            "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
+            "unk_token": tokenizer.convert_ids_to_tokens(
+                model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
+            )}
+        if 'falcon' in args.model_name_or_path:
+            spec_tokens["unk_token"] = 0
+        tokenizer.add_special_tokens(spec_tokens)
     
     if not args.full_finetune:
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
@@ -959,8 +962,12 @@ def train():
     #     if isinstance(module, torch.nn.Linear):
     #         module.bias.requires_grad = True
 
+    if "falcon" in args.net:
+        ln = torch.nn.LayerNorm
+    else:
+        ln = LlamaRMSNorm
     for name, module in model.named_modules():
-        if isinstance(module, LlamaRMSNorm):
+        if isinstance(module, ln):
             # print("Norm!")
             module.requires_grad_(True)
             for param in module.parameters():
@@ -1031,7 +1038,10 @@ def train():
 
 def run_omni_eval(args, model, tokenizer, verbose=False):
     args.net = args.model_name_or_path.split("/")[-1]
-    args.model_family = "llama" 
+    if "falcon" in args.net:
+        args.model_family = "falcon" # "llama" "falcon"
+    else:
+        args.model_family = 'llama'
     args.eval_ppl = True
     args.limit = -1
     args.cache_dir = "./cache"
@@ -1045,6 +1055,8 @@ def run_omni_eval(args, model, tokenizer, verbose=False):
     output_dir = Path(output_dir)
 
     lm = LMClass(args.model_name_or_path, model.model, tokenizer, args.batch_size)
+    if "falcon" in args.net:
+        lm.seqlen=2048
 
     logger_oe = create_logger(output_dir)
     if verbose:
