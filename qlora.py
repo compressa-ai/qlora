@@ -1,7 +1,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 import copy
 import json
 import os
@@ -80,14 +80,18 @@ def iterate_over_children(module, parent=None,
     if isinstance(module[1], torch.nn.Linear):
         # print(module[0])
         # pbar.update(1)
-        l = torch.nn.Linear(in_features=module[1].in_features, out_features=module[1].out_features, bias=True)
-        l.weight.data = module[1].weight.data
-        if module[1].bias:
-            l.bias.data = module[1].bias.data
+        bnb = True
+        if not bnb:
+            l = torch.nn.Linear(in_features=module[1].in_features, out_features=module[1].out_features, bias=True)
+            l.weight.data = module[1].weight.data
+            if module[1].bias:
+                l.bias.data = module[1].bias.data
+            else:
+                l.bias.data = torch.zeros_like(l.bias.data)
+            l.to(module[1].weight.device)
+            parent[1].__setattr__(module[0], l)
         else:
-            l.bias.data = torch.zeros_like(l.bias.data)
-        l.to(module[1].weight.device)
-        parent[1].__setattr__(module[0], l)
+            module[1].bias = torch.nn.Parameter(torch.zeros([module[1].out_features]).to(module[1].weight.device))
 
 
 def is_ipex_available():
@@ -140,11 +144,11 @@ class ModelArguments:
     load_awq: Optional[str] = field(default=None, metadata={"help": "Load the awq search results."})
     load_quant: Optional[str] = field(default=None, metadata={"help": "Load quantized model."})
     no_zero_point: Optional[bool] = field(default=False, metadata={"help": "disable zero_point"})
-    q_group_size: Optional[int] = field(default=128)
     omni_eval: Optional[bool] = field(default=False)
     tasks_str: Optional[str] = field(default="")
     batch_size: Optional[int] = field(default=1) 
     bnb: Optional[bool] = field(default=False) 
+    load_ln: Optional[str] = field(default=None)
 
 
 @dataclass
@@ -270,6 +274,11 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
     save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
     save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
+    omniquant: Optional[str] = field(default=None)
+    qlora: Optional[bool] = field(default=True)
+    ln: Optional[bool] = field(default=False)
+    biases: Optional[bool] = field(default=False)
+    q_group_size: Optional[int] = field(default=128)
 
 @dataclass
 class GenerationArguments:
@@ -307,7 +316,7 @@ def find_all_linear_names(args, model):
     cls = bnb.nn.Linear4bit if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
     if args.load_quant:
         cls = WQLinear
-    if args.load_awq:
+    if args.load_awq or args.omniquant:
         cls = torch.nn.Linear 
     lora_module_names = set()
     for name, module in model.named_modules():
@@ -331,6 +340,13 @@ class SavePeftModelCallback(transformers.TrainerCallback):
 
         peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
         kwargs["model"].save_pretrained(peft_model_path)
+        if args.ln:
+            lns = {}
+            for name, module in kwargs["model"].model.named_modules():
+                if isinstance(module, LlamaRMSNorm):
+                    lns[name] = module.state_dict()
+            
+            torch.save(lns, checkpoint_folder + "/ln.pt")
 
         pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
         if os.path.exists(pytorch_model_path):
@@ -374,7 +390,7 @@ def get_accelerate_model(args, checkpoint_dir):
     print(f'loading base model {args.model_name_or_path}...')
     compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
 
-    if not args.awq:
+    if args.bnb:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
             cache_dir=args.cache_dir,
@@ -395,7 +411,7 @@ def get_accelerate_model(args, checkpoint_dir):
             trust_remote_code=args.trust_remote_code,
             use_auth_token=args.use_auth_token
         )
-    else:
+    elif args.awq:
         config = AutoConfig.from_pretrained(args.model_name_or_path)
 
         if args.load_awq:
@@ -445,9 +461,34 @@ def get_accelerate_model(args, checkpoint_dir):
                     device_map=device_map,
                     offload_state_dict=True,
                 )
+                if args.load_ln:
+                    print("Loading lns...")
+                    lns = torch.load(args.load_ln, map_location='cpu')
+                    for name, sd in lns.items():
+                        # print(name)
+                        new_sd = OrderedDict()
+                        for key in sd:
+                            new_name = ".".join(name.split(".")[1:])
+                            new_name = ".".join([new_name, key])
+                            new_sd[new_name] = sd[key]
+                        missing_keys, unexpected_keys = model.model.load_state_dict(new_sd, strict=False)
+                        # print(unexpected_keys)
+
+                    if "falcon" in args.model_name_or_path:
+                        ln = torch.nn.LayerNorm
+                    else:
+                        ln = LlamaRMSNorm
+                    for name, module in model.named_modules():
+                        if isinstance(module, ln):
+                            # print("Norm!")
+                            module.requires_grad_(False)
+                            # for param in module.parameters():
+                            #     param.requires_grad = False 
+                            # for name, child in module.named_children():
+                            #     for param in child.parameters():
+                            #         param.requires_grad = False
         else:
-            kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
-            model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, config=config, trust_remote_code=True, **kwargs)
+            model = load_fp_model(args, config)
             kwargs = {"max_memory": max_memory} if len(max_memory) else {}
             device_map = infer_auto_device_map(
                     model,
@@ -456,23 +497,22 @@ def get_accelerate_model(args, checkpoint_dir):
                     **kwargs
                 )
 
-        # Dispatch model
-        # model.requires_grad_(False)
-        # for name, child in model.named_children():
-        #     for param in child.parameters():
-        #         param.requires_grad = False
+        model = simple_dispatch_model(model, device_map=device_map)
+        model.eval()
+    elif args.omniquant:
+        print(f'loading base model {args.omniquant}...')
+        config = AutoConfig.from_pretrained(args.omniquant)
+        kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
+        model = AutoModelForCausalLM.from_pretrained(args.omniquant, config=config, trust_remote_code=True, **kwargs)
 
-        # print(model)
-        # for name, module in model.named_modules():
-        #     if isinstance(module, LlamaRMSNorm):
-        #         # print("Norm!")
-        #         module.requires_grad_(True)
-        #         for param in module.parameters():
-        #             param.requires_grad = True 
-        #         for name, child in module.named_children():
-        #             for param in child.parameters():
-        #                 param.requires_grad = True
-
+        kwargs = {"max_memory": max_memory} if len(max_memory) else {}
+        device_map = infer_auto_device_map(
+                model,
+                no_split_module_classes=[
+                    "OPTDecoderLayer", "LlamaDecoderLayer", "BloomBlock", "MPTBlock", "DecoderLayer"],
+                **kwargs
+            )
+        model.enable_input_require_grads()
         model = simple_dispatch_model(model, device_map=device_map)
         model.eval()
 
@@ -516,11 +556,11 @@ def get_accelerate_model(args, checkpoint_dir):
         spec_tokens = {
             "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
             "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
-            "unk_token": tokenizer.convert_ids_to_tokens(
-                model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
-            )}
+            }
         if 'falcon' in args.model_name_or_path:
-            spec_tokens["unk_token"] = 0
+            spec_tokens["unk_token"] = tokenizer.convert_ids_to_tokens(0)
+        else:
+            spec_tokens["unk_token"] = tokenizer.convert_ids_to_tokens(model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id)
         tokenizer.add_special_tokens(spec_tokens)
     
     if not args.full_finetune:
@@ -532,7 +572,10 @@ def get_accelerate_model(args, checkpoint_dir):
             model = PeftModel.from_pretrained(model, join(checkpoint_dir, 'adapter_model'), is_trainable=True)
         else:
             print(f'adding LoRA modules...')
-            modules = [] #find_all_linear_names(args, model)
+            if args.qlora:
+                modules = find_all_linear_names(args, model)
+            else:
+                modules = []
             config = LoraConfig(
                 r=args.lora_r,
                 lora_alpha=args.lora_alpha,
@@ -555,6 +598,11 @@ def get_accelerate_model(args, checkpoint_dir):
                 if args.bf16 and module.weight.dtype == torch.float32:
                     module = module.to(torch.bfloat16)
     return model, tokenizer
+
+def load_fp_model(args, config):
+    kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
+    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, config=config, trust_remote_code=True, **kwargs)
+    return model
 
 def print_trainable_parameters(args, model):
     """
@@ -863,6 +911,43 @@ def train():
 
     model, tokenizer = get_accelerate_model(args, checkpoint_dir)
 
+    if args.biases:
+        # replace_linear(model)
+
+        # model.requires_grad_(False)
+        # for name, child in model.named_children():
+        #     for param in child.parameters():
+        #         param.requires_grad = False
+
+        for name, module in model.named_modules():
+            if isinstance(module, WQLinear):
+                if module.bias:
+                    module.bias.requires_grad = True
+                else:
+                    module.bias = torch.nn.Parameter(torch.zeros([module.out_features], dtype=torch.float16).to(module.qweight.device))
+                    module.bias.requires_grad = True
+            if isinstance(module, torch.nn.Linear):
+                if module.bias:
+                    module.bias.requires_grad = True
+                else:
+                    module.bias = torch.nn.Parameter(torch.zeros([module.out_features]).to(module.weight.device))
+                    module.bias.requires_grad = True
+
+    if args.ln:
+        if "falcon" in args.model_name_or_path:
+            ln = torch.nn.LayerNorm
+        else:
+            ln = LlamaRMSNorm
+        for name, module in model.named_modules():
+            if isinstance(module, ln):
+                # print("Norm!")
+                module.requires_grad_(True)
+                for param in module.parameters():
+                    param.requires_grad = True 
+                for name, child in module.named_children():
+                    for param in child.parameters():
+                        param.requires_grad = True
+
     model.config.use_cache = False
     print('loaded model')
     set_seed(args.seed)
@@ -951,30 +1036,6 @@ def train():
 
         trainer.add_callback(MMLUEvalCallback)
 
-    # replace_linear(model)
-
-    # model.requires_grad_(False)
-    # for name, child in model.named_children():
-    #     for param in child.parameters():
-    #         param.requires_grad = False
-
-    # for name, module in model.named_modules():
-    #     if isinstance(module, torch.nn.Linear):
-    #         module.bias.requires_grad = True
-
-    if "falcon" in args.net:
-        ln = torch.nn.LayerNorm
-    else:
-        ln = LlamaRMSNorm
-    for name, module in model.named_modules():
-        if isinstance(module, ln):
-            # print("Norm!")
-            module.requires_grad_(True)
-            for param in module.parameters():
-                param.requires_grad = True 
-            for name, child in module.named_children():
-                for param in child.parameters():
-                    param.requires_grad = True
 
     # Verifying the datatypes and parameter counts before training.
     print_trainable_parameters(args, model)
@@ -1065,7 +1126,15 @@ def run_omni_eval(args, model, tokenizer, verbose=False):
 
     ppl = results["wikitext2"]
     with open(os.path.join(args.output_dir, "omni_eval"+"_"+args.net, "eval.csv"), "+a") as f:
-        f.write(f"{args.net},{ppl},{args.bits},{args.awq},{args.bnb}\n")
+        tr = []
+        if args.qlora:
+            tr.append("qlora")
+        if args.ln:
+            tr.append("ln")
+        if args.biases:
+            tr.append("biases")
+        tr = "+".join(tr)
+        f.write(f"{args.net},{ppl},{args.bits},{args.awq},{args.bnb},{args.omniquant},{tr},{args.learning_rate},{args.q_group_size}\n")
         # f.write(f"{args.net},{ppl},{3},{args.awq},{args.bnb}\n")
 
 
