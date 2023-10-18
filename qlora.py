@@ -275,6 +275,7 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
     save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
     omniquant: Optional[str] = field(default=None)
+    omniquant_params: Optional[str] = field(default=None)
     qlora: Optional[bool] = field(default=True)
     ln: Optional[bool] = field(default=False)
     biases: Optional[bool] = field(default=False)
@@ -313,11 +314,12 @@ class GenerationArguments:
     no_repeat_ngram_size: Optional[int] = field(default=0)
 
 def find_all_linear_names(args, model):
-    cls = bnb.nn.Linear4bit if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
+    cls = bnb.nn.Linear4bit if args.bits == 4 else (
+        bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
     if args.load_quant:
         cls = WQLinear
     if args.load_awq or args.omniquant:
-        cls = torch.nn.Linear 
+        cls = torch.nn.Linear
     lora_module_names = set()
     for name, module in model.named_modules():
         if isinstance(module, cls):
@@ -500,10 +502,150 @@ def get_accelerate_model(args, checkpoint_dir):
         model = simple_dispatch_model(model, device_map=device_map)
         model.eval()
     elif args.omniquant:
+        sys.path.insert(0, '../OmniQuant')  # TODO: import omniquant
+        from models.int_llama_layer import QuantLlamaDecoderLayer
+        from quantize.int_linear import QuantLinear
+
+        wbits = 4
+        w_dynamic_method = "per_channel"
+
+        abits = 16
+        a_dynamic_method = "per_token"
+
+        @dataclass
+        class Args:
+            let = False
+            group_size = 128  # None, 128
+
+            weight_quant_params = {
+                "n_bits": wbits,
+                "per_channel_axes": [0],
+                "symmetric": False,
+                "dynamic_method": w_dynamic_method,
+                "group_size": group_size,
+                "lwc": True
+            }
+            act_quant_params = {
+                "n_bits": abits,
+                "per_channel_axes": [],
+                "symmetric": False,
+                "dynamic_method": "per_token",
+            }
+
+            q_quant_params = {
+                "n_bits": abits,
+                "per_channel_axes": [],
+                "symmetric": False,
+                "dynamic_method": "per_token",
+            }
+            k_quant_params = {
+                "n_bits": abits,
+                "per_channel_axes": [],
+                "symmetric": False,
+                "dynamic_method": a_dynamic_method,
+            }
+            v_quant_params = {
+                "n_bits": abits,
+                "per_channel_axes": [],
+                "symmetric": False,
+                "dynamic_method": a_dynamic_method,
+            }
+            p_quant_params = {
+                "n_bits": 16,
+                "metric": "fix0to1",
+            }
+
+        PRETRAINED_MODEL_PATH = '/data/shared/CompressaAI/LLaMA/Llama-2-13B-fp16'
+        OMNIPARAMS_FILE_PATH = '/data/shared/CompressaAI/experiments/clean/Llama-2-13b-w4a16g128-aug/logs/omni_parameters.pth'
+
         print(f'loading base model {args.omniquant}...')
         config = AutoConfig.from_pretrained(args.omniquant)
+
         kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
         model = AutoModelForCausalLM.from_pretrained(args.omniquant, config=config, trust_remote_code=True, **kwargs)
+
+        _args = Args()
+        omni_parameters = torch.load(args.omniquant_params)
+        layers = model.model.layers
+
+        for i in range(len(layers)):
+            layer = layers[i].to('cuda')
+
+            qlayer = QuantLlamaDecoderLayer(model.config, layer, _args)
+            qlayer.load_state_dict(omni_parameters[i], strict=False)
+
+            qlayer.let = False
+            qlayer.smooth_and_quant_inplace()
+
+            # qlayer.half()
+            # layers[i] = qlayer.to('cpu')
+            # del layer
+
+            for name, module in qlayer.named_modules():
+                if isinstance(module, QuantLinear):
+                    base_name = name.split('.')[-1]
+                    parent_orig = layer
+                    parent_quant = qlayer
+
+                    for name in name.split('.')[:-1]:
+                        parent_orig = getattr(parent_orig, name)
+                        parent_quant = getattr(parent_quant, name)
+
+                    module_orig = getattr(parent_orig, base_name)
+                    is_bias = module.bias is not None
+                    module_orig.weight.data = module.weight
+
+                    if is_bias:
+                        module_orig.bias.data = module.bias
+
+            del qlayer
+            torch.cuda.empty_cache()
+
+        # for name, module in model.named_modules():
+        #     if isinstance(module, QuantLinear):
+        #         del module.weight_quantizer.lowbound_factor
+        #         del module.weight_quantizer.upbound_factor
+        #
+        #     if isinstance(module, QuantLlamaDecoderLayer):
+        #         if _args.let:
+        #             del module.qkv_smooth_scale
+        #             del module.qkv_smooth_shift
+        #             del module.out_smooth_scale
+        #             del module.out_smooth_shift
+        #             del module.fc1_smooth_scale
+        #             del module.fc1_smooth_shift
+        #
+        #     torch.cuda.empty_cache()
+        #
+        # for name, module in model.named_modules():
+        #     if isinstance(module, QuantLinear):
+        #         is_bias = module.bias is not None
+        #
+        #         new_module = torch.nn.Linear(
+        #             in_features=module.weight.shape[-1],
+        #             out_features=module.weight.shape[0],
+        #             bias=is_bias
+        #         )
+        #         new_module.weight.data = module.weight
+        #
+        #         if is_bias:
+        #             new_module.bias.data = module.bias
+        #
+        #         base_name = name.split('.')[-1]
+        #         parent = model
+        #
+        #         for name in name.split('.')[:-1]:
+        #             parent = getattr(parent, name)
+        #
+        #         setattr(parent, base_name, new_module)
+        #
+        #         del module
+        #
+        #     torch.cuda.empty_cache()
+
+        # model.to('cuda:1')
+
+        print(f'applied omniquant params!')
 
         kwargs = {"max_memory": max_memory} if len(max_memory) else {}
         device_map = infer_auto_device_map(

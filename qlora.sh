@@ -1,16 +1,23 @@
 #python qlora.py --model_name_or_path /data/shared/CompressaAI/LLaMA/llama-1_2-7_13b/llama-7b --batch_size=8 --do_eval=false \
 # --do_train=true --omni_eval=true --dataset wikitext --awq=false --bits=4 --max_steps 2500 --bnb=true --learning_rate=0.00005
 
-d=/data/shared/CompressaAI/LLaMA/llama-1_2-7_13b
-MODEL=llama-7b
-pc=/data/shared/CompressaAI/experiments/clean
+d=/data/shared/CompressaAI
+MODEL=Llama-2-13B-fp16
+oqparams="/data/shared/CompressaAI/experiments/clean/Llama-2-13b-w4a16g128-aug/logs/omni_parameters.pth"
 g=64
 lr=0.000002
 
-for MODEL in llama-7b # llama-7b llama-13b Llama-2-7b-hf Llama-2-13b-hf
-# for oq in `ls /data/shared/CompressaAI/experiments/clean`
-do
-echo $MODEL
+# oq ln
+CUDA_VISIBLE_DEVICES=6 python qlora.py \
+  --model_name_or_path $d/LLaMA/$MODEL \
+  --omniquant $d/LLaMA/$MODEL \
+  --omniquant_params $oqparams \
+  --output_dir $d/experiments/Llama-2-13B-qlora-fake \
+  --q_backend fake \
+  --batch_size=8 --do_eval=false --do_train=true --qlora=false --ln=false --bias=false \
+  --omni_eval=true --dataset wikitext --bnb=false --awq=false \
+  --bits=4 --max_steps 2500 --learning_rate=$lr --lora_r=4
+
 # echo $oq
 
 # # fp ln
@@ -26,10 +33,10 @@ echo $MODEL
 #  --lora_r=4 --qlora=false --ln=false --bias=true
 
 # awq qlora ln bias
-python qlora.py --model_name_or_path $d/$MODEL --batch_size=8 --do_eval=false --q_backend real \
- --do_train=true --omni_eval=true --dataset wikitext --awq=true --bits=4 --max_steps 2500 \
- --bnb=false --learning_rate=$lr --load_quant=$d/quant_cache/$MODEL-w4-g$g-awq.pt --q_group_size $g \
- --lora_r=4 --qlora=true --ln=true --biases=true --output_dir=out/all
+#python qlora.py --model_name_or_path $d/$MODEL --batch_size=8 --do_eval=false --q_backend real \
+# --do_train=true --omni_eval=true --dataset wikitext --awq=true --bits=4 --max_steps 2500 \
+# --bnb=false --learning_rate=$lr --load_quant=$d/quant_cache/$MODEL-w4-g$g-awq.pt --q_group_size $g \
+# --lora_r=4 --qlora=true --ln=true --biases=true --output_dir=out/all
 
 # # awq qlora
 # python qlora.py --model_name_or_path $d/$MODEL --batch_size=8 --do_eval=false --q_backend real \
@@ -68,11 +75,6 @@ python qlora.py --model_name_or_path $d/$MODEL --batch_size=8 --do_eval=false --
 # python qlora.py --model_name_or_path $d/$MODEL --batch_size=8 --do_eval=false --do_train=true \
 #   --omni_eval=true --dataset wikitext --bnb=true --awq=false --bits=4 --max_steps 2500 --learning_rate=$lr \
 #   --lora_r=4 --qlora=false --ln=true --bias=false
-
-# # oq ln
-# python qlora.py --model_name_or_path $d/$MODEL --omniquant $pc/$oq/ckpt \
-#   --batch_size=8 --do_eval=false --do_train=true --qlora=false --ln=false --bias=false \
-#   --omni_eval=true --dataset wikitext --bnb=false --awq=false --bits=4 --max_steps 2500 --learning_rate=$lr --lora_r=4
 
 done
 
